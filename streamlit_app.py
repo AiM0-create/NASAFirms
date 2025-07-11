@@ -1,39 +1,25 @@
 import streamlit as st
 import pandas as pd
-import geopandas as gpd
 import h3
 import requests
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, mapping
 import pydeck as pdk
 import numpy as np
 from datetime import datetime
 
-# --- CONFIGURATION ---
-
-# For best security, use secrets: st.secrets["FIRMS_API_KEY"]
-API_KEY = "fbc1a3e4195587859716ff9cdb486900"  # Place your NASA FIRMS API key here
-
-# --- DATA FETCHING FUNCTIONS ---
+API_KEY = "fbc1a3e4195587859716ff9cdb486900"
 
 @st.cache_data(ttl=900)
 def fetch_firms(bbox, days, sensor):
-    """
-    Fetch fire data from NASA FIRMS API for a bounding box, days, and sensor.
-    Returns a DataFrame.
-    """
     url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{API_KEY}/{sensor}/{bbox}/{days}"
     try:
         df = pd.read_csv(url)
         return df
     except Exception as e:
         st.error(f"Error fetching data from FIRMS API: {e}")
-        return pd.DataFrame()  # Return empty on error
+        return pd.DataFrame()
 
 def hex_aggregate(df, resolution=5):
-    """
-    Aggregate fire points into H3 hexagons at the given resolution.
-    Calculates frequency and mean brightness per hex.
-    """
     df["hex_id"] = df.apply(lambda x: h3.geo_to_h3(x.latitude, x.longitude, resolution), axis=1)
     agg = df.groupby("hex_id").agg(
         frequency=("acq_date", "count"),
@@ -43,20 +29,7 @@ def hex_aggregate(df, resolution=5):
     ).reset_index()
     return agg
 
-def hex_polygons(agg, resolution=5):
-    """
-    Converts H3 hex IDs into polygon geometries (GeoDataFrame).
-    """
-    agg["geometry"] = agg["hex_id"].apply(
-        lambda h: Polygon(h3.h3_to_geo_boundary(h, geo_json=True))
-    )
-    gdf = gpd.GeoDataFrame(agg, geometry="geometry", crs="EPSG:4326")
-    return gdf
-
 def bivariate_color(row, freq_q, bright_q):
-    """
-    Returns color for a hexagon based on frequency and brightness quantiles.
-    """
     if row["frequency"] >= freq_q[1]:
         if row["mean_brightness"] >= bright_q[1]:
             return [50, 0, 70]    # deep purple/black (high-high)
@@ -69,12 +42,25 @@ def bivariate_color(row, freq_q, bright_q):
             return [200, 200, 220]  # light-grey (low-low)
 
 def hex_elevation(row, freq_q):
-    """
-    Height (3D extrusion) for hexagon based on frequency.
-    """
     return 2000 if row["frequency"] >= freq_q[1] else 400
 
-# --- STREAMLIT APP LAYOUT ---
+def build_geojson(agg, resolution=5):
+    """Directly build a GeoJSON FeatureCollection as dict (no geopandas)."""
+    features = []
+    for _, row in agg.iterrows():
+        hex_boundary = h3.h3_to_geo_boundary(row["hex_id"], geo_json=True)
+        poly = Polygon(hex_boundary)
+        features.append({
+            "type": "Feature",
+            "geometry": mapping(poly),
+            "properties": {
+                "frequency": int(row["frequency"]),
+                "mean_brightness": float(row["mean_brightness"]),
+                "color": row["color"],
+                "elevation": int(row["elevation"])
+            }
+        })
+    return {"type": "FeatureCollection", "features": features}
 
 st.set_page_config(layout="wide")
 st.title("🔥 22+ Years of Forest Fire: Interactive Bivariate Hex Map (Live FIRMS, India)")
@@ -95,8 +81,6 @@ with st.sidebar:
     year = st.selectbox("Year (filter)", ["All"] + list(range(2001, datetime.now().year + 1))[::-1])
     month = st.selectbox("Month (filter)", ["All"] + [datetime(2000, i, 1).strftime('%B') for i in range(1, 13)])
     resolution = st.slider("Hex Resolution (smaller=larger hex)", 3, 7, 5, help="Lower is coarser (bigger hexes).")
-
-# --- DATA LOADING AND FILTERING ---
 
 df = fetch_firms(bbox, days, sensor)
 if df.empty:
@@ -123,15 +107,13 @@ if len(df) == 0:
     st.warning("No data available for the selected filters.")
 else:
     agg = hex_aggregate(df, resolution=resolution)
-    gdf = hex_polygons(agg, resolution=resolution)
+    # Compute quantiles for mapping
+    freq_q = np.quantile(agg["frequency"], [0.5, 0.9])
+    bright_q = np.quantile(agg["mean_brightness"], [0.5, 0.9])
+    agg["color"] = agg.apply(lambda r: bivariate_color(r, freq_q, bright_q), axis=1)
+    agg["elevation"] = agg.apply(lambda r: hex_elevation(r, freq_q), axis=1)
 
-    freq_q = np.quantile(gdf["frequency"], [0.5, 0.9])
-    bright_q = np.quantile(gdf["mean_brightness"], [0.5, 0.9])
-
-    gdf["color"] = gdf.apply(lambda r: bivariate_color(r, freq_q, bright_q), axis=1)
-    gdf["elevation"] = gdf.apply(lambda r: hex_elevation(r, freq_q), axis=1)
-
-    geojson = gdf.__geo_interface__
+    geojson = build_geojson(agg, resolution=resolution)
 
     layer = pdk.Layer(
         "GeoJsonLayer",

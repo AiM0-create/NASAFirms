@@ -3,6 +3,6 @@ pandas>=2.0
 numpy>=1.23
 geopandas>=0.14
 shapely>=2.0
-h3>=3.7
+h3-py
 pydeck>=0.8
 requests>=2.31
